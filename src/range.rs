@@ -712,17 +712,31 @@ fn primitive(input: &str) -> IResult<&str, Option<BoundSet>, SemverParseError<&s
                     build,
                     pre_release,
                 })),
+                // An omitted component after `<=` is an X-Range, and every
+                // version the X stands for satisfies it: `<=7.x` is `<8.0.0-0`
+                // and `<=0.7.x` is `<0.8.0-0`, the same expansion the
+                // `GreaterThan` arms above and hyphen ranges below apply.
+                (LessThanEquals, Partial { major: None, .. }) => {
+                    BoundSet::at_least(Predicate::Including((0, 0, 0).into()))
+                }
                 (
                     LessThanEquals,
                     Partial {
-                        major,
-                        minor,
+                        major: Some(major),
+                        minor: Some(minor),
                         patch: None,
                         ..
                     },
-                ) => BoundSet::at_most(Predicate::Including(
-                    (major.unwrap_or(0), minor.unwrap_or(0), 0, 0).into(),
-                )),
+                ) => BoundSet::at_most(Predicate::Excluding((major, minor + 1, 0, 0).into())),
+                (
+                    LessThanEquals,
+                    Partial {
+                        major: Some(major),
+                        minor: None,
+                        patch: None,
+                        ..
+                    },
+                ) => BoundSet::at_most(Predicate::Excluding((major + 1, 0, 0, 0).into())),
                 (LessThanEquals, partial) => {
                     BoundSet::at_most(Predicate::Including(partial.into()))
                 }
@@ -1181,18 +1195,18 @@ create_tests_for! {
     allows_any
 
     greater_than_eq_123   => ">=1.2.3", {
-        allows => ["<=1.2.4", "3.0.0", "<2", ">=3", ">3.0.0"],
-        denies => ["<=1.2.0", "1.0.0", "<1", "<=1.2"],
+        allows => ["<=1.2.4", "3.0.0", "<2", ">=3", ">3.0.0", "<=1.2"],
+        denies => ["<=1.2.0", "1.0.0", "<1"],
     },
 
     greater_than_123   => ">1.2.3", {
-        allows => ["<=1.2.4", "3.0.0", "<2", ">=3", ">3.0.0"],
-        denies => ["<=1.2.3", "1.0.0", "<1", "<=1.2"],
+        allows => ["<=1.2.4", "3.0.0", "<2", ">=3", ">3.0.0", "<=1.2"],
+        denies => ["<=1.2.3", "1.0.0", "<1"],
     },
 
     eq_123   => "1.2.3", {
-        allows => ["1.2.3", "1 - 2"],
-        denies => ["<1.2.3", "1.0.0", "<=1.2", ">4.5.6", ">5"],
+        allows => ["1.2.3", "1 - 2", "<=1.2"],
+        denies => ["<1.2.3", "1.0.0", ">4.5.6", ">5"],
     },
 
     lt_eq_123  => "<=1.2.3", {
@@ -1648,7 +1662,11 @@ mod tests {
         single_sided_lower_equals_bound_2 => [">=0.1.97", ">=0.1.97"],
         single_sided_lower_bound => [">1.0.0", ">1.0.0"],
         single_sided_upper_equals_bound => ["<=2.0.0", "<=2.0.0"],
-        single_sided_upper_equals_bound_with_minor => ["<=2.0", "<=2.0.0-0"],
+        single_sided_upper_equals_bound_with_minor => ["<=2.0", "<2.1.0-0"],
+        single_sided_upper_equals_bound_with_major => ["<=2", "<3.0.0-0"],
+        single_sided_upper_equals_bound_with_major_x => ["<=16.x", "<17.0.0-0"],
+        single_sided_upper_equals_bound_with_patch_x => ["<=1.2.x", "<1.3.0-0"],
+        single_sided_upper_equals_bound_with_asterisk => ["<=*", ">=0.0.0"],
         single_sided_upper_bound => ["<2.0.0", "<2.0.0"],
         major_and_minor => ["2.3", ">=2.3.0 <2.4.0-0"],
         major_dot_x => ["2.x", ">=2.0.0 <3.0.0-0"],
