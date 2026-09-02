@@ -249,6 +249,33 @@ impl Bound {
     }
 }
 
+/// Where a bound sits relative to the version it names: an upper `<v`
+/// closes just below `v`, `>=v` and `<=v` sit on `v` itself, and a lower
+/// `>v` opens just above it. Ordering two bounds is ordering the
+/// positions they occupy on the version line.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Offset {
+    JustBelow,
+    On,
+    JustAbove,
+}
+
+impl Bound {
+    /// The version this bound names and the side of it the bound falls
+    /// on. `None` for an unbounded end, which names no version.
+    fn position(&self) -> Option<(&Version, Offset)> {
+        use Bound::*;
+        use Predicate::*;
+
+        match self {
+            Upper(Excluding(v)) => Some((v, Offset::JustBelow)),
+            Upper(Including(v)) | Lower(Including(v)) => Some((v, Offset::On)),
+            Lower(Excluding(v)) => Some((v, Offset::JustAbove)),
+            Lower(Unbounded) | Upper(Unbounded) => None,
+        }
+    }
+}
+
 impl Ord for Bound {
     fn cmp(&self, other: &Self) -> Ordering {
         use Bound::*;
@@ -258,49 +285,12 @@ impl Ord for Bound {
             (Lower(Unbounded), Lower(Unbounded)) | (Upper(Unbounded), Upper(Unbounded)) => {
                 Ordering::Equal
             }
-            (Upper(Unbounded), _) | (_, Lower(Unbounded)) => Ordering::Greater,
             (Lower(Unbounded), _) | (_, Upper(Unbounded)) => Ordering::Less,
-
-            (Upper(Including(v1)), Upper(Including(v2)))
-            | (Upper(Including(v1)), Lower(Including(v2)))
-            | (Upper(Excluding(v1)), Upper(Excluding(v2)))
-            | (Upper(Excluding(v1)), Lower(Excluding(v2)))
-            | (Lower(Including(v1)), Upper(Including(v2)))
-            | (Lower(Including(v1)), Lower(Including(v2)))
-            | (Lower(Excluding(v1)), Lower(Excluding(v2))) => v1.cmp(v2),
-
-            (Lower(Excluding(v1)), Upper(Excluding(v2)))
-            | (Lower(Including(v1)), Upper(Excluding(v2))) => {
-                if v2 <= v1 {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            }
-            (Upper(Including(v1)), Upper(Excluding(v2)))
-            | (Upper(Including(v1)), Lower(Excluding(v2)))
-            | (Lower(Excluding(v1)), Upper(Including(v2))) => {
-                if v2 < v1 {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            }
-            (Lower(Excluding(v1)), Lower(Including(v2))) => {
-                if v1 < v2 {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                }
-            }
-            (Lower(Including(v1)), Lower(Excluding(v2)))
-            | (Upper(Excluding(v1)), Lower(Including(v2)))
-            | (Upper(Excluding(v1)), Upper(Including(v2))) => {
-                if v1 <= v2 {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                }
+            (Upper(Unbounded), _) | (_, Lower(Unbounded)) => Ordering::Greater,
+            _ => {
+                let (this, this_offset) = self.position().expect("bound is not unbounded");
+                let (that, that_offset) = other.position().expect("bound is not unbounded");
+                this.cmp(that).then(this_offset.cmp(&that_offset))
             }
         }
     }
@@ -1289,6 +1279,7 @@ mod intersection {
             ("2.0.0", None),
             ("1.2.3", Some("1.2.3")),
             (">1.2.3", None),
+            ("<1.2.3", None),
             ("<=1.2.3", Some("1.2.3")),
             ("1.1.1", None),
             ("<1.0.0", None),
