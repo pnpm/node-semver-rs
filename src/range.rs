@@ -409,6 +409,14 @@ impl Range {
     /**
     Returns a new range that is the set-intersection between this range and `other`.
     */
+    ///
+    /// Pairing every alternative of `self` with every alternative of
+    /// `other` keeps the whole product when the alternatives overlap, so
+    /// a chain of intersections would multiply the alternative count on
+    /// each step. Overlapping alternatives of the result are therefore
+    /// merged whenever the merged alternative is satisfied by exactly the
+    /// versions the two were, prereleases included. When nothing merges,
+    /// the alternatives keep their order.
     pub fn intersect(&self, other: &Self) -> Option<Self> {
         let mut sets = Vec::new();
 
@@ -423,7 +431,7 @@ impl Range {
         if sets.is_empty() {
             None
         } else {
-            Some(Self(sets))
+            Some(Self(merge_overlapping(sets)))
         }
     }
 
@@ -484,6 +492,110 @@ impl Range {
             None
         }
     }
+}
+
+/// `sets` with each run of overlapping alternatives merged where
+/// [`merge_exactly`] allows it, or `sets` unchanged when none merges.
+fn merge_overlapping(sets: Vec<BoundSet>) -> Vec<BoundSet> {
+    if sets.len() < 2 {
+        return sets;
+    }
+    let mut sorted = sets.clone();
+    sorted.sort_by(|a, b| a.lower.cmp(&b.lower).then_with(|| a.upper.cmp(&b.upper)));
+    sorted.dedup();
+    let mut merged: Vec<BoundSet> = Vec::with_capacity(sorted.len());
+    for set in sorted {
+        if let Some(last) = merged.last_mut() {
+            if let Some(joined) = merge_exactly(last, &set) {
+                *last = joined;
+                continue;
+            }
+        }
+        merged.push(set);
+    }
+    if merged.len() == sets.len() {
+        sets
+    } else {
+        merged
+    }
+}
+
+/// One alternative satisfied by exactly the versions `a` or `b` is, or
+/// `None` when they do not overlap or when no single alternative is.
+///
+/// Release versions are satisfied by the merged interval exactly when
+/// they are by one of the two overlapping intervals. A prerelease is
+/// satisfied only when a bound of its own alternative names a prerelease
+/// of the same `major.minor.patch`, and merging drops two of the four
+/// bounds, so each such `major.minor.patch` is checked separately.
+fn merge_exactly(a: &BoundSet, b: &BoundSet) -> Option<BoundSet> {
+    let joined = join_overlapping(a, b)?;
+    let bounds = [&a.lower, &a.upper, &b.lower, &b.upper];
+    let prerelease_tuples = bounds
+        .iter()
+        .copied()
+        .filter_map(|bound| bound.position())
+        .map(|(version, _)| version)
+        .filter(|version| version.is_prerelease());
+    for version in prerelease_tuples {
+        let zone = prerelease_zone(version);
+        let from_a = accepted_prereleases(a, version, &zone);
+        let from_b = accepted_prereleases(b, version, &zone);
+        let from_joined = accepted_prereleases(&joined, version, &zone);
+        let union = match (from_a, from_b) {
+            (None, None) => None,
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (Some(left), Some(right)) => Some(join_overlapping(&left, &right)?),
+        };
+        if union != from_joined {
+            return None;
+        }
+    }
+    Some(joined)
+}
+
+/// The interval `a` and `b` cover together, when they share a version.
+fn join_overlapping(a: &BoundSet, b: &BoundSet) -> Option<BoundSet> {
+    let (first, second) = if a.lower <= b.lower { (a, b) } else { (b, a) };
+    if second.lower > first.upper {
+        return None;
+    }
+    let upper = std::cmp::max(&first.upper, &second.upper);
+    BoundSet::new(first.lower.clone(), upper.clone())
+}
+
+/// The prereleases of `version`'s `major.minor.patch` that `set`
+/// accepts, as an interval.
+fn accepted_prereleases(set: &BoundSet, version: &Version, zone: &BoundSet) -> Option<BoundSet> {
+    let names_the_tuple = [&set.lower, &set.upper]
+        .iter()
+        .copied()
+        .filter_map(|bound| bound.position())
+        .any(|(bound_version, _)| {
+            bound_version.is_prerelease() && same_tuple(bound_version, version)
+        });
+    if names_the_tuple {
+        set.intersect(zone)
+    } else {
+        None
+    }
+}
+
+/// Every prerelease of `version`'s `major.minor.patch`: from `-0` up to,
+/// not including, the release.
+fn prerelease_zone(version: &Version) -> BoundSet {
+    let release = Version::from((version.major, version.minor, version.patch));
+    let mut lowest = release.clone();
+    lowest.pre_release.push(Identifier::Numeric(0));
+    BoundSet::new(
+        Bound::Lower(Predicate::Including(lowest)),
+        Bound::Upper(Predicate::Excluding(release)),
+    )
+    .expect("a prerelease zone is never empty")
+}
+
+fn same_tuple(a: &Version, b: &Version) -> bool {
+    a.major == b.major && a.minor == b.minor && a.patch == b.patch
 }
 
 impl fmt::Display for Range {
@@ -1846,5 +1958,176 @@ mod min_version_tests {
                 version
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod merged_intersection {
+    use super::*;
+
+    fn v(range: &str) -> Range {
+        range.parse().unwrap()
+    }
+
+    fn intersect_without_merging(left: &Range, right: &Range) -> Option<Range> {
+        let sets: Vec<BoundSet> = left
+            .0
+            .iter()
+            .flat_map(|lefty| {
+                right
+                    .0
+                    .iter()
+                    .filter_map(move |righty| lefty.intersect(righty))
+            })
+            .collect();
+        if sets.is_empty() {
+            None
+        } else {
+            Some(Range(sets))
+        }
+    }
+
+    #[test]
+    fn overlapping_alternatives_merge() {
+        let merged = v(">=1.0.0 <2.0.0 || >=1.5.0 <3.0.0")
+            .intersect(&Range::any())
+            .unwrap();
+        assert_eq!(merged.to_string(), ">=1.0.0 <3.0.0");
+    }
+
+    #[test]
+    fn caret_upper_bounds_do_not_block_a_merge() {
+        let merged = v("^1.2.0 || >=1.5.0 <3.0.0-0")
+            .intersect(&Range::any())
+            .unwrap();
+        assert_eq!(merged.to_string(), ">=1.2.0 <3.0.0-0");
+    }
+
+    #[test]
+    fn a_bound_that_admits_prereleases_is_not_merged_away() {
+        let range = v(">=1.0.0 <1.9.0-rc.2 || >=1.5.0 <3.0.0");
+        let intersection = range.intersect(&Range::any()).unwrap();
+        assert_eq!(intersection.to_string(), range.to_string());
+        assert!(intersection.satisfies(&"1.9.0-rc.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn disjoint_alternatives_keep_their_order() {
+        let range = v("^3.0.0 || ^1.0.0");
+        let intersection = range.intersect(&Range::any()).unwrap();
+        assert_eq!(intersection.to_string(), range.to_string());
+    }
+
+    #[test]
+    fn a_chain_of_overlapping_unions_stays_small() {
+        let mut acc = Range::any();
+        for patch in 0..64 {
+            let next = v(&format!(">=1.0.{patch} <3.0.0 || >=1.5.{patch} <4.0.0"));
+            acc = acc.intersect(&next).unwrap();
+            assert!(acc.0.len() <= 2, "step {}: {}", patch, acc);
+        }
+        assert_eq!(acc.to_string(), ">=1.0.63 <4.0.0");
+    }
+
+    /// xorshift64, so the property test needs no dependency and is
+    /// reproducible.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    const PRERELEASES: [&str; 5] = ["", "-0", "-alpha", "-alpha.1", "-beta"];
+
+    fn version_strings() -> Vec<String> {
+        let mut versions = Vec::new();
+        for major in 0..4 {
+            for minor in 0..3 {
+                for patch in 0..3 {
+                    for pre in PRERELEASES {
+                        versions.push(format!("{major}.{minor}.{patch}{pre}"));
+                    }
+                }
+            }
+        }
+        versions
+    }
+
+    fn random_alternative(rng: &mut Rng, versions: &[String]) -> String {
+        let a = &versions[rng.below(versions.len())];
+        let b = &versions[rng.below(versions.len())];
+        match rng.below(9) {
+            0 => format!(">={a} <{b}"),
+            1 => format!(">{a} <={b}"),
+            2 => format!("^{a}"),
+            3 => format!("~{a}"),
+            4 => a.clone(),
+            5 => format!(">={a}"),
+            6 => format!("<{b}"),
+            7 => format!("{a} - {b}"),
+            _ => format!(">={a} <={b}"),
+        }
+    }
+
+    fn random_range(rng: &mut Rng, versions: &[String]) -> Option<Range> {
+        let count = 1 + rng.below(4);
+        let alternatives: Vec<String> = (0..count)
+            .map(|_| random_alternative(rng, versions))
+            .collect();
+        Range::parse(alternatives.join(" || ")).ok()
+    }
+
+    /// Merging never changes which versions an intersection accepts.
+    #[test]
+    fn merging_accepts_exactly_the_versions_pairing_does() {
+        let versions = version_strings();
+        let parsed: Vec<Version> = versions.iter().map(|s| s.parse().unwrap()).collect();
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut checked = 0;
+        for _ in 0..20_000 {
+            let steps = 2 + rng.below(3);
+            let ranges: Vec<Range> = (0..steps)
+                .filter_map(|_| random_range(&mut rng, &versions))
+                .collect();
+            if ranges.len() < 2 {
+                continue;
+            }
+            let mut expected = Some(ranges[0].clone());
+            let mut actual = Some(ranges[0].clone());
+            for range in &ranges[1..] {
+                expected = expected.and_then(|acc| intersect_without_merging(&acc, range));
+                actual = actual.and_then(|acc| acc.intersect(range));
+            }
+            let description = ranges
+                .iter()
+                .map(Range::to_string)
+                .collect::<Vec<_>>()
+                .join(" ∩ ");
+            assert_eq!(expected.is_some(), actual.is_some(), "{description}");
+            if let (Some(expected), Some(actual)) = (expected, actual) {
+                for version in &parsed {
+                    assert_eq!(
+                        expected.satisfies(version),
+                        actual.satisfies(version),
+                        "{version} against {description}: {expected} vs {actual}",
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 5_000,
+            "only {} chains had an intersection",
+            checked
+        );
     }
 }
