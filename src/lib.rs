@@ -23,6 +23,8 @@ use nom::{Err, IResult};
 
 pub use range::*;
 
+pub mod npm;
+
 mod range;
 
 /// JavaScript's
