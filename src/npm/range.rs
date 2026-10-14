@@ -1,0 +1,400 @@
+//! `classes/range.js` and `classes/comparator.js`, as far as `validRange`
+//! goes: parsing a range into comparator sets and formatting it back.
+
+use super::{js, re::re, version};
+
+/// `<0.0.0-0`: the comparator no version satisfies.
+const NULL_SET: &str = "<0.0.0-0";
+
+/// `new Range(text).set` as comparator values (`""` for any version), or
+/// `None` where `new Range(text)` throws.
+fn comparator_values(text: &str) -> Option<Vec<Vec<String>>> {
+    let raw = js::collapse_spaces(js::trim(text));
+    let mut sets = raw
+        .split("||")
+        .map(|part| parse_range(js::trim(part)))
+        .collect::<Option<Vec<_>>>()?;
+    sets.retain(|set| !set.is_empty());
+    if sets.is_empty() {
+        return None;
+    }
+    if sets.len() > 1 {
+        let first = sets[0].clone();
+        sets.retain(|set| set[0] != NULL_SET);
+        if sets.is_empty() {
+            sets = vec![first];
+        } else if let Some(any) = sets.iter().find(|set| set.len() == 1 && set[0].is_empty()) {
+            sets = vec![any.clone()];
+        }
+    }
+    Some(sets)
+}
+
+/// A comparator of a parsed range: `operator` is `""`, `<`, `<=`, `>` or
+/// `>=`; `version` is `None` for the comparator that allows any version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Comparator {
+    pub operator: String,
+    pub version: Option<version::Version>,
+}
+
+impl Comparator {
+    fn from_value(value: &str) -> Option<Self> {
+        if value.is_empty() {
+            return Some(Self {
+                operator: String::new(),
+                version: None,
+            });
+        }
+        let operator: String = value
+            .chars()
+            .take_while(|c| matches!(c, '<' | '>' | '='))
+            .collect();
+        let version = version::parse(&value[operator.len()..])?;
+        Some(Self {
+            operator,
+            version: Some(version),
+        })
+    }
+
+    /// `comparator.test(version)`.
+    fn test(&self, candidate: &version::Version) -> bool {
+        let Some(version) = &self.version else {
+            return true;
+        };
+        let order = candidate.compare(version);
+        match self.operator.as_str() {
+            "" => order.is_eq(),
+            ">" => order.is_gt(),
+            ">=" => order.is_ge(),
+            "<" => order.is_lt(),
+            "<=" => order.is_le(),
+            _ => false,
+        }
+    }
+}
+
+/// `new Range(text).set`: comparator sets, any of which may match.
+pub fn range_set(text: &str) -> Option<Vec<Vec<Comparator>>> {
+    comparator_values(text)?
+        .iter()
+        .map(|set| {
+            set.iter()
+                .map(|value| Comparator::from_value(value))
+                .collect()
+        })
+        .collect()
+}
+
+/// `range.test(version)` without `includePrerelease`: a prerelease matches
+/// only a set naming a prerelease of the same `major.minor.patch`.
+fn test(sets: &[Vec<Comparator>], version: &version::Version) -> bool {
+    sets.iter().any(|set| {
+        if !set.iter().all(|comparator| comparator.test(version)) {
+            return false;
+        }
+        if version.prerelease.is_empty() {
+            return true;
+        }
+        set.iter()
+            .filter_map(|comparator| comparator.version.as_ref())
+            .any(|allowed| {
+                !allowed.prerelease.is_empty()
+                    && (allowed.major, allowed.minor, allowed.patch)
+                        == (version.major, version.minor, version.patch)
+            })
+    })
+}
+
+/// `semver.minVersion(text)` threw: an invalid range, or a set where the
+/// any-version comparator remained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinVersionError;
+
+/// `semver.minVersion(text)`: the lowest version the range allows, if any.
+pub fn min_version(text: &str) -> Result<Option<version::Version>, MinVersionError> {
+    let sets = range_set(text).ok_or(MinVersionError)?;
+    for candidate in ["0.0.0", "0.0.0-0"] {
+        let candidate = version::parse(candidate).ok_or(MinVersionError)?;
+        if test(&sets, &candidate) {
+            return Ok(Some(candidate));
+        }
+    }
+    let mut minimum: Option<version::Version> = None;
+    for set in &sets {
+        let mut lowest: Option<version::Version> = None;
+        for comparator in set {
+            let mut candidate = comparator.version.clone().ok_or(MinVersionError)?;
+            match comparator.operator.as_str() {
+                ">" => candidate.bump_lowest_above(),
+                "" | ">=" => {}
+                _ => continue,
+            }
+            if lowest
+                .as_ref()
+                .is_none_or(|lowest| candidate.compare(lowest).is_gt())
+            {
+                lowest = Some(candidate);
+            }
+        }
+        if let Some(lowest) = lowest {
+            if minimum
+                .as_ref()
+                .is_none_or(|minimum| minimum.compare(&lowest).is_gt())
+            {
+                minimum = Some(lowest);
+            }
+        }
+    }
+    Ok(minimum.filter(|minimum| test(&sets, minimum)))
+}
+
+/// `semver.validRange(text)`: the normalized range, `"*"` for any version,
+/// or `None` where `new Range(text)` throws.
+pub fn valid_range(text: &str) -> Option<String> {
+    let sets = comparator_values(text)?;
+    let formatted = sets
+        .iter()
+        .map(|set| {
+            set.iter()
+                .map(|value| js::trim(value))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("||");
+    Some(if formatted.is_empty() {
+        "*".to_string()
+    } else {
+        formatted
+    })
+}
+
+/// `Range.parseRange`: the comparator values of one `||` alternative.
+fn parse_range(range: &str) -> Option<Vec<String>> {
+    let re = re();
+    let range = js::replace(range, &re.hyphen_range, false, hyphen_replace);
+    let range = js::replace(&range, &re.comparator_trim, true, |groups| {
+        groups[1..=3]
+            .iter()
+            .map(|group| group.unwrap_or_default())
+            .collect()
+    });
+    let range = js::replace(&range, &re.tilde_trim, true, |groups| {
+        format!("{}~", groups[1].unwrap_or_default())
+    });
+    let range = js::replace(&range, &re.caret_trim, true, |groups| {
+        format!("{}^", groups[1].unwrap_or_default())
+    });
+    let parsed: Vec<String> = range.split(' ').map(parse_comparator).collect();
+    let joined = parsed.join(" ");
+    let values = js::split_spaces(&joined)
+        .into_iter()
+        .map(|comp| {
+            comparator(&js::replace(js::trim(comp), &re.gte0, false, |_| {
+                String::new()
+            }))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let mut unique: Vec<String> = Vec::new();
+    for value in values {
+        if value == NULL_SET {
+            return Some(vec![value]);
+        }
+        if !unique.contains(&value) {
+            unique.push(value);
+        }
+    }
+    if unique.len() > 1 {
+        unique.retain(|value| !value.is_empty());
+    }
+    Some(unique)
+}
+
+/// `new Comparator(text).value`: `""` for any version.
+fn comparator(text: &str) -> Option<String> {
+    let comp = js::split_spaces(js::trim(text)).join(" ");
+    let groups = js::match_groups(&comp, &re().comparator)?;
+    let operator = match groups[1].unwrap_or_default() {
+        "=" => "",
+        operator => operator,
+    };
+    match groups[2].filter(|version| !version.is_empty()) {
+        None => Some(String::new()),
+        Some(version) => Some(format!("{operator}{}", version::parse(version)?.version)),
+    }
+}
+
+/// `parseComparator`.
+fn parse_comparator(comp: &str) -> String {
+    let comp = each(js::trim(comp), replace_caret);
+    let comp = each(js::trim(&comp), replace_tilde);
+    let comp = each(&comp, replace_xrange);
+    js::replace(js::trim(&comp), &re().star, false, |_| String::new())
+}
+
+/// `comp.split(/\s+/).map(f).join(' ')`.
+fn each(comp: &str, f: fn(&str) -> String) -> String {
+    js::split_spaces(comp)
+        .into_iter()
+        .map(f)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `isX`.
+fn is_x(id: Option<&str>) -> bool {
+    match id {
+        None | Some("") | Some("*") => true,
+        Some(id) => id.eq_ignore_ascii_case("x"),
+    }
+}
+
+fn group<'a>(groups: &[Option<&'a str>], index: usize) -> &'a str {
+    groups[index].unwrap_or_default()
+}
+
+/// `replaceTilde`.
+fn replace_tilde(comp: &str) -> String {
+    js::replace(comp, &re().tilde, false, |groups| {
+        let (major, minor, patch, pre) = (groups[1], groups[2], groups[3], groups[4]);
+        let (mj, mn, pt) = (group(groups, 1), group(groups, 2), group(groups, 3));
+        if is_x(major) {
+            String::new()
+        } else if is_x(minor) {
+            format!(">={mj}.0.0 <{}.0.0-0", js::increment(mj))
+        } else if is_x(patch) {
+            format!(">={mj}.{mn}.0 <{mj}.{}.0-0", js::increment(mn))
+        } else if let Some(pre) = pre.filter(|pre| !pre.is_empty()) {
+            format!(">={mj}.{mn}.{pt}-{pre} <{mj}.{}.0-0", js::increment(mn))
+        } else {
+            format!(">={mj}.{mn}.{pt} <{mj}.{}.0-0", js::increment(mn))
+        }
+    })
+}
+
+/// `replaceCaret` without `includePrerelease`.
+fn replace_caret(comp: &str) -> String {
+    js::replace(comp, &re().caret, false, |groups| {
+        let (major, minor, patch, pre) = (groups[1], groups[2], groups[3], groups[4]);
+        let (mj, mn, pt) = (group(groups, 1), group(groups, 2), group(groups, 3));
+        let pre = pre
+            .filter(|pre| !pre.is_empty())
+            .map(|pre| format!("-{pre}"));
+        if is_x(major) {
+            String::new()
+        } else if is_x(minor) {
+            format!(">={mj}.0.0 <{}.0.0-0", js::increment(mj))
+        } else if is_x(patch) {
+            if mj == "0" {
+                format!(">={mj}.{mn}.0 <{mj}.{}.0-0", js::increment(mn))
+            } else {
+                format!(">={mj}.{mn}.0 <{}.0.0-0", js::increment(mj))
+            }
+        } else {
+            let lower = format!(">={mj}.{mn}.{pt}{}", pre.unwrap_or_default());
+            if mj != "0" {
+                format!("{lower} <{}.0.0-0", js::increment(mj))
+            } else if mn != "0" {
+                format!("{lower} <{mj}.{}.0-0", js::increment(mn))
+            } else {
+                format!("{lower} <{mj}.{mn}.{}-0", js::increment(pt))
+            }
+        }
+    })
+}
+
+/// `replaceXRange` without `includePrerelease`.
+fn replace_xrange(comp: &str) -> String {
+    js::replace(js::trim(comp), &re().xrange, false, |groups| {
+        let x_major = is_x(groups[2]);
+        let x_minor = x_major || is_x(groups[3]);
+        let any_x = x_minor || is_x(groups[4]);
+        let mut gtlt = group(groups, 1);
+        if gtlt == "=" && any_x {
+            gtlt = "";
+        }
+        let (mut major, mut minor) = (group(groups, 2).to_string(), group(groups, 3).to_string());
+        if x_major {
+            return if gtlt == ">" || gtlt == "<" {
+                NULL_SET.into()
+            } else {
+                "*".into()
+            };
+        }
+        if !gtlt.is_empty() && any_x {
+            if x_minor {
+                minor = "0".into();
+            }
+            let patch = "0";
+            let mut pre = "";
+            if gtlt == ">" {
+                gtlt = ">=";
+                if x_minor {
+                    major = js::increment(&major);
+                    minor = "0".into();
+                } else {
+                    minor = js::increment(&minor);
+                }
+            } else if gtlt == "<=" {
+                gtlt = "<";
+                if x_minor {
+                    major = js::increment(&major);
+                } else {
+                    minor = js::increment(&minor);
+                }
+            }
+            if gtlt == "<" {
+                pre = "-0";
+            }
+            return format!("{gtlt}{major}.{minor}.{patch}{pre}");
+        }
+        if x_minor {
+            return format!(">={major}.0.0 <{}.0.0-0", js::increment(&major));
+        }
+        if any_x {
+            return format!(">={major}.{minor}.0 <{major}.{}.0-0", js::increment(&minor));
+        }
+        group(groups, 0).to_string()
+    })
+}
+
+/// `hyphenReplace(false)`: `1.2 - 3.4` to `>=1.2.0 <3.5.0-0`.
+fn hyphen_replace(groups: &[Option<&str>]) -> String {
+    // npm writes `>=${from}` whether or not `from` has a prerelease.
+    let (from, f_major, f_minor, f_patch) = (group(groups, 1), groups[2], groups[3], groups[4]);
+    let (to, t_major, t_minor, t_patch, t_pre) = (
+        group(groups, 7),
+        groups[8],
+        groups[9],
+        groups[10],
+        groups[11],
+    );
+    let (fm, fn_) = (f_major.unwrap_or_default(), f_minor.unwrap_or_default());
+    let from = if is_x(f_major) {
+        String::new()
+    } else if is_x(f_minor) {
+        format!(">={fm}.0.0")
+    } else if is_x(f_patch) {
+        format!(">={fm}.{fn_}.0")
+    } else {
+        format!(">={from}")
+    };
+    let (tm, tn, tp) = (
+        t_major.unwrap_or_default(),
+        t_minor.unwrap_or_default(),
+        t_patch.unwrap_or_default(),
+    );
+    let to = if is_x(t_major) {
+        String::new()
+    } else if is_x(t_minor) {
+        format!("<{}.0.0-0", js::increment(tm))
+    } else if is_x(t_patch) {
+        format!("<{tm}.{}.0-0", js::increment(tn))
+    } else if let Some(pre) = t_pre.filter(|pre| !pre.is_empty()) {
+        format!("<={tm}.{tn}.{tp}-{pre}")
+    } else {
+        format!("<={to}")
+    };
+    js::trim(&format!("{from} {to}")).to_string()
+}
