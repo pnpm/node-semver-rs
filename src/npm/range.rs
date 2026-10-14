@@ -6,9 +6,9 @@ use super::{js, re::re, version};
 /// `<0.0.0-0`: the comparator no version satisfies.
 const NULL_SET: &str = "<0.0.0-0";
 
-/// `semver.validRange(text)`: the normalized range, `"*"` for any version,
-/// or `None` where `new Range(text)` throws.
-pub fn valid_range(text: &str) -> Option<String> {
+/// `new Range(text).set` as comparator values (`""` for any version), or
+/// `None` where `new Range(text)` throws.
+fn comparator_values(text: &str) -> Option<Vec<Vec<String>>> {
     let raw = js::collapse_spaces(js::trim(text));
     let mut sets = raw
         .split("||")
@@ -27,6 +27,132 @@ pub fn valid_range(text: &str) -> Option<String> {
             sets = vec![any.clone()];
         }
     }
+    Some(sets)
+}
+
+/// A comparator of a parsed range: `operator` is `""`, `<`, `<=`, `>` or
+/// `>=`; `version` is `None` for the comparator that allows any version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Comparator {
+    pub operator: String,
+    pub version: Option<version::Version>,
+}
+
+impl Comparator {
+    fn from_value(value: &str) -> Option<Self> {
+        if value.is_empty() {
+            return Some(Self {
+                operator: String::new(),
+                version: None,
+            });
+        }
+        let operator: String = value
+            .chars()
+            .take_while(|c| matches!(c, '<' | '>' | '='))
+            .collect();
+        let version = version::parse(&value[operator.len()..])?;
+        Some(Self {
+            operator,
+            version: Some(version),
+        })
+    }
+
+    /// `comparator.test(version)`.
+    fn test(&self, candidate: &version::Version) -> bool {
+        let Some(version) = &self.version else {
+            return true;
+        };
+        let order = candidate.compare(version);
+        match self.operator.as_str() {
+            "" => order.is_eq(),
+            ">" => order.is_gt(),
+            ">=" => order.is_ge(),
+            "<" => order.is_lt(),
+            "<=" => order.is_le(),
+            _ => false,
+        }
+    }
+}
+
+/// `new Range(text).set`: comparator sets, any of which may match.
+pub fn range_set(text: &str) -> Option<Vec<Vec<Comparator>>> {
+    comparator_values(text)?
+        .iter()
+        .map(|set| {
+            set.iter()
+                .map(|value| Comparator::from_value(value))
+                .collect()
+        })
+        .collect()
+}
+
+/// `range.test(version)` without `includePrerelease`: a prerelease matches
+/// only a set naming a prerelease of the same `major.minor.patch`.
+fn test(sets: &[Vec<Comparator>], version: &version::Version) -> bool {
+    sets.iter().any(|set| {
+        if !set.iter().all(|comparator| comparator.test(version)) {
+            return false;
+        }
+        if version.prerelease.is_empty() {
+            return true;
+        }
+        set.iter()
+            .filter_map(|comparator| comparator.version.as_ref())
+            .any(|allowed| {
+                !allowed.prerelease.is_empty()
+                    && (allowed.major, allowed.minor, allowed.patch)
+                        == (version.major, version.minor, version.patch)
+            })
+    })
+}
+
+/// `semver.minVersion(text)` threw: an invalid range, or a set where the
+/// any-version comparator remained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinVersionError;
+
+/// `semver.minVersion(text)`: the lowest version the range allows, if any.
+pub fn min_version(text: &str) -> Result<Option<version::Version>, MinVersionError> {
+    let sets = range_set(text).ok_or(MinVersionError)?;
+    for candidate in ["0.0.0", "0.0.0-0"] {
+        let candidate = version::parse(candidate).ok_or(MinVersionError)?;
+        if test(&sets, &candidate) {
+            return Ok(Some(candidate));
+        }
+    }
+    let mut minimum: Option<version::Version> = None;
+    for set in &sets {
+        let mut lowest: Option<version::Version> = None;
+        for comparator in set {
+            let mut candidate = comparator.version.clone().ok_or(MinVersionError)?;
+            match comparator.operator.as_str() {
+                ">" => candidate.bump_lowest_above(),
+                "" | ">=" => {}
+                _ => continue,
+            }
+            if lowest
+                .as_ref()
+                .is_none_or(|lowest| candidate.compare(lowest).is_gt())
+            {
+                lowest = Some(candidate);
+            }
+        }
+        if let Some(lowest) = lowest {
+            if minimum
+                .as_ref()
+                .is_none_or(|minimum| minimum.compare(&lowest).is_gt())
+            {
+                minimum = Some(lowest);
+            }
+        }
+    }
+    Ok(minimum.filter(|minimum| test(&sets, minimum)))
+}
+
+/// `semver.validRange(text)`: the normalized range, `"*"` for any version,
+/// or `None` where `new Range(text)` throws.
+pub fn valid_range(text: &str) -> Option<String> {
+    let sets = comparator_values(text)?;
     let formatted = sets
         .iter()
         .map(|set| {

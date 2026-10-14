@@ -76,3 +76,71 @@ fn loose_compare_matches_npm_semver() {
         failures.join("\n")
     );
 }
+
+/// `[range, new Range(range).set as [operator, version|null], minVersion(range)]`
+/// from semver 7.7.1; `minVersion` is `[version, major, minor, patch,
+/// prerelease]`, `null`, or `"throw"`.
+#[test]
+fn range_sets_and_min_version_match_npm_semver() {
+    let rows: Vec<Value> =
+        serde_json::from_str(include_str!("fixtures/npm-semver-7.7.1-ranges.json")).unwrap();
+    let mut failures = Vec::new();
+    for row in &rows {
+        let input = row[0].as_str().unwrap();
+        let set = npm::range_set(input).map(|sets| {
+            sets.iter()
+                .map(|set| {
+                    set.iter()
+                        .map(|comparator| {
+                            serde_json::json!([
+                                comparator.operator,
+                                comparator
+                                    .version
+                                    .as_ref()
+                                    .map(|version| version.version.clone()),
+                            ])
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        });
+        let set = set.map_or(Value::Null, |set| serde_json::json!(set));
+        if set != row[1] {
+            failures.push(format!("set({input:?}): npm {}, ours {set}", row[1]));
+        }
+        let minimum = match npm::min_version(input) {
+            Err(_) => Value::from("throw"),
+            Ok(None) => Value::Null,
+            Ok(Some(version)) => {
+                let prerelease: Vec<Value> = version
+                    .prerelease
+                    .iter()
+                    .map(|id| match id {
+                        Identifier::Numeric(number) => Value::from(*number),
+                        Identifier::Alphanumeric(text) => Value::from(text.clone()),
+                    })
+                    .collect();
+                serde_json::json!([
+                    version.version,
+                    version.major,
+                    version.minor,
+                    version.patch,
+                    prerelease
+                ])
+            }
+        };
+        if minimum != row[2] {
+            failures.push(format!(
+                "minVersion({input:?}): npm {}, ours {minimum}",
+                row[2]
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} rows differ:\n{}",
+        failures.len(),
+        rows.len(),
+        failures.join("\n")
+    );
+}

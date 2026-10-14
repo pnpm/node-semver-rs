@@ -16,5 +16,5 @@ mod range;
 mod re;
 mod version;
 
-pub use range::valid_range;
+pub use range::{min_version, range_set, valid_range, Comparator, MinVersionError};
 pub use version::{coerce, compare, parse, parse_loose, valid, Identifier, Version};

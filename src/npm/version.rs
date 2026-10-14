@@ -88,6 +88,17 @@ fn parse_with(text: &str, loose: bool) -> Option<Version> {
     })
 }
 
+/// `version.format()`.
+fn format_version(major: u64, minor: u64, patch: u64, prerelease: &[Identifier]) -> String {
+    let mut version = format!("{major}.{minor}.{patch}");
+    if !prerelease.is_empty() {
+        let ids: Vec<String> = prerelease.iter().map(ToString::to_string).collect();
+        version.push('-');
+        version.push_str(&ids.join("."));
+    }
+    version
+}
+
 fn identifier(id: &str) -> Identifier {
     if !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()) {
         let number = js::number(id);
@@ -99,6 +110,17 @@ fn identifier(id: &str) -> Identifier {
 }
 
 impl Version {
+    /// The lowest version above this one, as `minVersion` derives it from a
+    /// `>` comparator: the next patch, or a `0` prerelease identifier appended.
+    pub(crate) fn bump_lowest_above(&mut self) {
+        if self.prerelease.is_empty() {
+            self.patch += 1;
+        } else {
+            self.prerelease.push(Identifier::Numeric(0));
+        }
+        self.version = format_version(self.major, self.minor, self.patch, &self.prerelease);
+    }
+
     /// `version.compare(other)`: main version, then prerelease; build
     /// metadata is ignored.
     pub fn compare(&self, other: &Self) -> Ordering {
