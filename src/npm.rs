@@ -17,4 +17,4 @@ mod re;
 mod version;
 
 pub use range::valid_range;
-pub use version::{coerce, parse, valid, Identifier, Version};
+pub use version::{coerce, compare, parse, parse_loose, valid, Identifier, Version};

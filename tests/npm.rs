@@ -47,3 +47,32 @@ fn matches_npm_semver() {
         failures.join("\n")
     );
 }
+
+/// `[left, right, compare(left, right, { loose: true, includePrerelease: true })]`
+/// from semver 7.7.1, `null` where it throws.
+#[test]
+fn loose_compare_matches_npm_semver() {
+    use std::cmp::Ordering;
+    let rows: Vec<(String, String, Option<i8>)> =
+        serde_json::from_str(include_str!("fixtures/npm-semver-7.7.1-compare-loose.json")).unwrap();
+    let mut failures = Vec::new();
+    for (left, right, expected) in &rows {
+        let actual = npm::compare(left, right, true).map(|order| match order {
+            Ordering::Less => -1,
+            Ordering::Equal => 0,
+            Ordering::Greater => 1,
+        });
+        if actual != *expected {
+            failures.push(format!(
+                "compare({left:?}, {right:?}): npm {expected:?}, ours {actual:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} rows differ:\n{}",
+        failures.len(),
+        rows.len(),
+        failures.join("\n")
+    );
+}

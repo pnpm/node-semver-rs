@@ -1,8 +1,9 @@
-//! `classes/semver.js` (construction and `format`), `functions/parse.js`,
-//! `functions/valid.js` and `functions/coerce.js` without options.
+//! `classes/semver.js` (construction, `format` and `compare`),
+//! `functions/parse.js`, `functions/valid.js`, `functions/coerce.js` and
+//! `functions/compare.js`.
 
 use super::{js, re::re};
-use std::fmt;
+use std::{cmp::Ordering, fmt};
 
 const MAX_LENGTH: usize = 256;
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
@@ -43,10 +44,21 @@ impl fmt::Display for Version {
 
 /// `semver.parse(text)`: `None` where `new SemVer(text)` throws.
 pub fn parse(text: &str) -> Option<Version> {
+    parse_with(text, false)
+}
+
+/// `semver.parse(text, { loose: true })`: also `v1.2.3`, `=1.2.3`, `01.2.3`
+/// and `1.2.3beta`.
+pub fn parse_loose(text: &str) -> Option<Version> {
+    parse_with(text, true)
+}
+
+fn parse_with(text: &str, loose: bool) -> Option<Version> {
     if js::length(text) > MAX_LENGTH {
         return None;
     }
-    let groups = js::match_groups(js::trim(text), &re().full)?;
+    let regex = if loose { &re().loose } else { &re().full };
+    let groups = js::match_groups(js::trim(text), regex)?;
     let component = |index: usize| {
         let value = js::number(groups[index]?);
         (0.0..=MAX_SAFE_INTEGER)
@@ -84,6 +96,64 @@ fn identifier(id: &str) -> Identifier {
         }
     }
     Identifier::Alphanumeric(id.to_string())
+}
+
+impl Version {
+    /// `version.compare(other)`: main version, then prerelease; build
+    /// metadata is ignored.
+    pub fn compare(&self, other: &Self) -> Ordering {
+        if self.version == other.version {
+            return Ordering::Equal;
+        }
+        let main =
+            (self.major, self.minor, self.patch).cmp(&(other.major, other.minor, other.patch));
+        main.then_with(|| compare_prerelease(&self.prerelease, &other.prerelease))
+    }
+}
+
+/// `comparePre`: a version without a prerelease is greater.
+fn compare_prerelease(left: &[Identifier], right: &[Identifier]) -> Ordering {
+    match (left.is_empty(), right.is_empty()) {
+        (true, true) => return Ordering::Equal,
+        (false, true) => return Ordering::Less,
+        (true, false) => return Ordering::Greater,
+        (false, false) => {}
+    }
+    for index in 0.. {
+        match (left.get(index), right.get(index)) {
+            (None, None) => return Ordering::Equal,
+            (Some(_), None) => return Ordering::Greater,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(a), Some(b)) if a == b => {}
+            (Some(a), Some(b)) => return compare_identifiers(a, b),
+        }
+    }
+    Ordering::Equal
+}
+
+/// `compareIdentifiers`: numeric identifiers compare as numbers and sort
+/// before alphanumeric ones, which compare as strings.
+fn compare_identifiers(left: &Identifier, right: &Identifier) -> Ordering {
+    let numeric = |id: &Identifier| match id {
+        Identifier::Numeric(number) => Some(*number as f64),
+        Identifier::Alphanumeric(text) => (!text.is_empty()
+            && text.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| js::number(text)),
+    };
+    match (numeric(left), numeric(right)) {
+        (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => {
+            let utf16 = |id: &Identifier| id.to_string().encode_utf16().collect::<Vec<_>>();
+            utf16(left).cmp(&utf16(right))
+        }
+    }
+}
+
+/// `semver.compare(left, right, { loose })`: `None` where either side does not parse.
+pub fn compare(left: &str, right: &str, loose: bool) -> Option<Ordering> {
+    Some(parse_with(left, loose)?.compare(&parse_with(right, loose)?))
 }
 
 /// `semver.valid(text)`.

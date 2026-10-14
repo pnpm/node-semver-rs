@@ -12,6 +12,7 @@ const LETTERDASHNUMBER: &str = "[a-zA-Z0-9-]";
 
 pub(crate) struct Re {
     pub(crate) full: Regex,
+    pub(crate) loose: Regex,
     pub(crate) xrange: Regex,
     pub(crate) coerce: Regex,
     pub(crate) tilde_trim: Regex,
@@ -72,6 +73,7 @@ fn build() -> Re {
     let lone_caret = r"(?:\^)";
     Re {
         full: safe(&format!("^{full_plain}$")),
+        loose: safe(&format!("^{loose_plain}$")),
         xrange: safe(&format!(r"^{gtlt}\s*{xrange_plain}$")),
         coerce: safe(&format!(r"{coerce_plain}(?:$|[^\d])")),
         tilde_trim: safe(&format!(r"(\s*){lone_tilde}\s+")),
